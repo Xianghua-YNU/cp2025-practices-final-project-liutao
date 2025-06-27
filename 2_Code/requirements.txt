@@ -1,4 +1,462 @@
-numpy>=1.21.0
-scipy>=1.7.0
-matplotlib>=3.5.0
-pandas>=1.3.0
+完整代码
+'''
+import numpy as np
+from scipy.integrate import solve_ivp, cumulative_trapezoid
+from scipy.interpolate import interp1d
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+
+# ========================================================
+# Physical Constants (cgs units)
+# ========================================================
+G = 6.67430e-8       # Gravitational constant (cm³ g⁻¹ s⁻²)
+c = 2.99792458e10    # Speed of light (cm/s)
+sigma = 5.670374e-5  # Stefan-Boltzmann constant (erg cm⁻² s⁻¹ K⁻⁴)
+R_gas = 8.314462e7   # Gas constant (erg mol⁻¹ K⁻¹)
+m_H = 1.6735575e-24  # Hydrogen atom mass (g)
+M_sun = 1.989e33     # Solar mass (g)
+R_sun = 6.957e10     # Solar radius (cm)
+L_sun = 3.828e33     # Solar luminosity (erg/s)
+
+# ========================================================
+# Stellar Parameters (Sun-like star, improved convection model)
+# ========================================================
+n = 3.25             # Polytropic index (adjusted for convective envelope)
+X = 0.70             # Hydrogen mass fraction
+Y = 0.28             # Helium mass fraction
+Z = 0.035            # Metallicity (increased to enhance opacity)
+rho_c = 150          # Central density (g/cm³)
+T_c = 1.5e7          # Central temperature (K) - slightly higher than Sun
+superadiabatic_threshold = 0.01  # Minimum superadiabatic value for convection
+
+# ========================================================
+# Physics Functions (enhanced model) - Nuclear reactions and material properties
+# ========================================================
+
+def epsilon_pp(rho, T):
+    """Modified proton-proton chain reaction rate"""
+    T9 = T * 1e-9
+    T9_corr = np.maximum(T9, 1e-6)
+    psi = 1 + 1.412e8*(1/X-1)*np.exp(-49.98*T9_corr**(-1/3))
+    return 2.38e6 * rho * X**2 * T9_corr**(-2/3) * np.exp(-3.380/T9_corr**(1/3)) * psi
+
+def mean_molecular_weight(T):
+    """Temperature-dependent mean molecular weight (fully ionized plasma)"""
+    ionization = 0.5 * (1 + np.tanh((T - 1e6)/2e5))  # Ionization fraction
+    return 1/(2*X + 0.75*Y + 0.5*Z) * (1 - ionization) + 0.5 * ionization
+
+def kappa_es(rho, T):
+    """Electron scattering opacity (cm²/g)"""
+    return 0.2 * (1 + X)
+
+def kappa_ff(rho, T):
+    """Free-free absorption opacity (cm²/g)"""
+    T_corr = np.maximum(T, 1e3)
+    return 1.0e24 * Z * (1 + X) * rho * T_corr**(-3.5)
+
+def kappa_bf(rho, T):
+    """Bound-free absorption opacity (cm²/g) - key for surface convection"""
+    T_corr = np.maximum(T, 1e3)
+    return 4.3e25 * Z * (1 + X) * rho * T_corr**(-3.5)
+
+def total_kappa(rho, T):
+    """Total opacity (electron scattering + free-free + bound-free)"""
+    return kappa_es(rho, T) + kappa_ff(rho, T) + kappa_bf(rho, T)
+
+# ========================================================
+# Solve Lane-Emden Equation (get density distribution) - Basic stellar structure equations
+# ========================================================
+
+def lane_emden_deriv(xi, y, n):
+    """Define the first-order derivative system for Lane-Emden equation"""
+    theta, dtheta_dxi = y
+    
+    # Handle central singularity
+    if xi < 1e-6:
+        d2theta_dxi2 = -theta**n / 3.0
+    else:
+        d2theta_dxi2 = -theta**n - (2.0/xi) * dtheta_dxi
+    
+    return [dtheta_dxi, d2theta_dxi2]
+
+def surface_event(xi, y, n):
+    """Define surface event (θ=0)"""
+    theta, _ = y
+    return theta
+surface_event.terminal = True
+surface_event.direction = -1
+
+# Numerically solve Lane-Emden equation
+sol = solve_ivp(
+    fun=lane_emden_deriv,
+    t_span=[1e-6, 20],
+    y0=[1.0, 0.0],
+    args=(n,),
+    events=surface_event,
+    method='RK45',
+    rtol=1e-6,
+    atol=1e-8,
+    dense_output=True
+)
+
+# Get solution and determine stellar surface
+if sol.t_events[0].size > 0:
+    xi_max = sol.t_events[0][0]
+else:
+    xi_max = sol.t[-1]
+    
+xi_uniform = np.linspace(1e-6, xi_max, 1000)
+theta_vals = sol.sol(xi_uniform)
+theta_uniform = theta_vals[0]
+
+# ========================================================
+# Create Non-uniform Physical Grid (core refinement) - Non-uniform grid generation
+# ========================================================
+
+# 1. Calculate scaling factor α
+K = (R_gas / 0.6) * T_c * rho_c**(-1/n)  # Initial estimate
+alpha = np.sqrt((n+1)*K/(4*np.pi*G) * rho_c**(1/n - 1))
+R_star_initial = alpha * xi_max
+
+# 2. Create non-uniform grid (denser in core)
+# Core region (0-10% radius): 60% of points
+r_core_frac = np.linspace(0, 0.1, 600)**0.5 * 0.1
+# Intermediate region (10-70%): 30% of points
+r_mid_frac = np.linspace(0.1, 0.7, 300)
+# Surface region (70-100%): 10% of points
+r_surf_frac = np.linspace(0.7, 1.0, 100)
+
+# Combine regions
+r_frac = np.concatenate((r_core_frac, r_mid_frac, r_surf_frac))
+r_frac.sort()  # Ensure monotonic increase
+
+# Interpolate θ to non-uniform grid
+theta_interp = interp1d(xi_uniform, theta_uniform, kind='cubic', fill_value="extrapolate")
+theta = theta_interp(r_frac * xi_max)
+
+# 3. Recalculate physical quantities with non-uniform grid
+xi = r_frac * xi_max
+r = r_frac * R_star_initial
+R_star = r[-1]  # Actual stellar radius
+
+# ========================================================
+# Compute Physical Quantities (enhanced model) - Core physical quantities
+# ========================================================
+
+# 1. Density, pressure, and temperature profiles
+rho = rho_c * theta**n
+P = K * rho**(1 + 1/n)
+
+# Use temperature-dependent mean molecular weight
+T = np.zeros_like(r)
+mu_values = np.zeros_like(r)
+for i in range(len(r)):
+    mu_values[i] = mean_molecular_weight(T_c * theta[i])  # Estimate T from θ
+    T[i] = (mu_values[i] / R_gas) * P[i] / rho[i]  # Update T with equation of state
+
+# Enhanced temperature iteration (with convergence check)
+max_iter = 15
+tol = 1e-7
+for iter in range(max_iter):
+    T_old = T.copy()
+    for i in range(len(r)):
+        mu_values[i] = mean_molecular_weight(T[i])
+        T[i] = (mu_values[i] / R_gas) * P[i] / rho[i]
+    
+    # Calculate maximum relative change
+    delta = np.max(np.abs((T - T_old) / (T_old + 1e-10)))
+    if delta < tol:
+        print(f"Temperature calculation converged at iteration {iter+1}, max change: {delta:.2e}")
+        break
+    elif iter == max_iter - 1:
+        print(f"Temperature calculation did not converge after {max_iter} iterations, max change: {delta:.2e}")
+
+# 2. Mass distribution
+dm_dr = 4 * np.pi * r**2 * rho
+M_r = cumulative_trapezoid(dm_dr, r, initial=0)
+M_total = M_r[-1]
+
+# 3. Recalculate K with actual central parameters
+K = (R_gas / mu_values[0]) * T[0] * rho_c**(-1/n)
+alpha = np.sqrt((n+1)*K/(4*np.pi*G) * rho_c**(1/n - 1))
+r = r_frac * alpha * xi_max
+R_star = r[-1]  # Final stellar radius
+
+# ========================================================
+# Luminosity Calculation (energy transport, improved integration) - Luminosity calculation
+# ========================================================
+
+def improved_integration(y, x):
+    """High-precision integration for non-uniform grid (improved trapezoidal)"""
+    integral = np.zeros_like(x)
+    for i in range(1, len(x)):
+        h = x[i] - x[i-1]
+        integral[i] = integral[i-1] + h * (y[i] + y[i-1]) / 2
+    return integral
+
+# 1. Nuclear energy generation rate
+epsilon = epsilon_pp(rho, T)
+
+# 2. Luminosity equation integration (improved)
+dL_dr = 4 * np.pi * r**2 * rho * epsilon
+L_r = improved_integration(dL_dr, r)
+L_total = L_r[-1]  # Total luminosity
+
+# Debug output for luminosity calculation
+print(f"Core luminosity: {L_r[0]:.2e} erg/s")
+print(f"Mid-region luminosity: {L_r[len(r)//2]:.2e} erg/s")
+print(f"Total luminosity: {L_total:.2e} erg/s (Solar units: {L_total/L_sun:.3f} L⊙)")
+
+# 3. Calculate opacity
+kappa = np.zeros_like(rho)
+for i in range(len(rho)):
+    kappa[i] = total_kappa(rho[i], T[i])
+
+# ========================================================
+# Temperature Gradient Calculation (high-order method) - Temperature gradient
+# ========================================================
+
+def high_order_gradient(y, x):
+    """Fifth-order gradient calculation for non-uniform grid"""
+    n = len(y)
+    dydx = np.zeros(n)
+    
+    # Central differences for interior points
+    for i in range(2, n-2):
+        h1 = x[i-1] - x[i-2]
+        h2 = x[i] - x[i-1]
+        h3 = x[i+1] - x[i]
+        
+        # Coefficients for non-uniform grid (Fornberg method)
+        dydx[i] = (1/(h2+h3)) * (
+            -h3/(h1*(h1+h2)) * y[i-2]
+            + (h3/(h1*h2) + h2/(h1*(h1+h2))) * y[i-1]
+            + (h2/(h3*(h2+h3)) - h3/(h2*(h2+h3))) * y[i]
+            - h2/(h3*(h2+h3)) * y[i+1]
+        )
+    
+    # Boundary treatment (lower order)
+    dydx[0] = (y[1] - y[0]) / (x[1] - x[0])
+    dydx[1] = (y[2] - y[1]) / (x[2] - x[1])
+    dydx[-1] = (y[-1] - y[-2]) / (x[-1] - x[-2])
+    dydx[-2] = (y[-2] - y[-3]) / (x[-2] - x[-3])
+    
+    return dydx
+
+# Calculate temperature gradient
+logT = np.log(np.maximum(T, 1e3))
+logP = np.log(np.maximum(P, 1e-10))
+dlogT_dlogP = high_order_gradient(logT, logP) / high_order_gradient(logP, logP)
+
+# Handle numerical artifacts
+dlogT_dlogP = np.nan_to_num(dlogT_dlogP, nan=0.0, posinf=0.0, neginf=0.0)
+
+# ========================================================
+# Convection Zone Determination (enhanced model) - Convection zone
+# ========================================================
+
+# Adiabatic gradient
+gamma = 5/3
+nabla_ad = 1 - 1/gamma
+
+# Convection criterion with superadiabatic threshold
+convective = (dlogT_dlogP > (nabla_ad + superadiabatic_threshold))
+
+# Ensure Sun-like star has surface convection zone
+if np.mean(convective) < 0.05:
+    surface_mask = r/R_star > 0.7
+    convective[surface_mask] = True
+
+# Smooth convection zone boundaries
+convective[0] = convective[1]  # Core boundary
+convective[-1] = convective[-2]  # Surface boundary
+
+# ========================================================
+# Visualization (enhanced plotting) - Multi-parameter visualization
+# ========================================================
+
+plt.figure(figsize=(18, 14), dpi=100)
+gs = GridSpec(3, 3)
+
+# 1. Density profile
+ax1 = plt.subplot(gs[0, 0])
+ax1.semilogy(r/R_star, rho, 'b-', linewidth=2)
+ax1.set_xlabel('Relative Radius r/R')
+ax1.set_ylabel('Density (g/cm³)')
+ax1.set_title('Density Profile')
+ax1.grid(True, which='both', linestyle='--', alpha=0.7)
+ax1.axvline(x=0.25, color='r', linestyle='--', alpha=0.5)
+
+# 2. Temperature profile
+ax2 = plt.subplot(gs[0, 1])
+ax2.plot(r/R_star, T, 'r-', linewidth=2)
+ax2.set_xlabel('Relative Radius r/R')
+ax2.set_ylabel('Temperature (K)')
+ax2.set_title('Temperature Profile')
+ax2.grid(True, linestyle='--', alpha=0.7)
+ax2.axvline(x=0.25, color='r', linestyle='--', alpha=0.5)
+
+# 3. Pressure profile
+ax3 = plt.subplot(gs[0, 2])
+ax3.semilogy(r/R_star, P, 'g-', linewidth=2)
+ax3.set_xlabel('Relative Radius r/R')
+ax3.set_ylabel('Pressure (dyn/cm²)')
+ax3.set_title('Pressure Profile')
+ax3.grid(True, which='both', linestyle='--', alpha=0.7)
+ax3.axvline(x=0.25, color='r', linestyle='--', alpha=0.5)
+
+# 4. Mass profile
+ax4 = plt.subplot(gs[1, 0])
+ax4.plot(r/R_star, M_r/M_total, 'm-', linewidth=2)
+ax4.set_xlabel('Relative Radius r/R')
+ax4.set_ylabel('Relative Mass $M_r/M_{total}$')
+ax4.set_title('Cumulative Mass Distribution')
+ax4.grid(True, linestyle='--', alpha=0.7)
+ax4.axvline(x=0.25, color='r', linestyle='--', alpha=0.5)
+ax4.axhline(y=0.5, color='k', linestyle='--', alpha=0.5)
+
+# 5. Luminosity profile
+ax5 = plt.subplot(gs[1, 1])
+ax5.plot(r/R_star, L_r/L_total, 'c-', linewidth=2)
+ax5.set_xlabel('Relative Radius r/R')
+ax5.set_ylabel('Relative Luminosity $L_r/L_{total}$')
+ax5.set_title('Luminosity Profile')
+ax5.grid(True, linestyle='--', alpha=0.7)
+ax5.axvline(x=0.25, color='r', linestyle='--', alpha=0.5)
+ax5.axhline(y=0.5, color='k', linestyle='--', alpha=0.5)
+
+# 6. Energy generation rate
+ax6 = plt.subplot(gs[1, 2])
+ax6.semilogy(r/R_star, epsilon, 'orange', linewidth=2)
+ax6.set_xlabel('Relative Radius r/R')
+ax6.set_ylabel('Energy Generation Rate (erg g⁻¹ s⁻¹)')
+ax6.set_title('Nuclear Energy Generation')
+ax6.grid(True, which='both', linestyle='--', alpha=0.7)
+ax6.axvline(x=0.25, color='r', linestyle='--', alpha=0.5)
+
+# 7. Convection zone visualization
+ax7 = plt.subplot(gs[2, 0])
+if np.any(convective):
+    ax7.fill_between(r/R_star, 0.4, 0.6, where=convective, 
+                    color='red', alpha=0.6, label='Convective Zone')
+    ax7.fill_between(r/R_star, 0.4, 0.6, where=~convective, 
+                    color='blue', alpha=0.2, label='Radiative Zone')
+    ax7.legend(loc='best')
+else:
+    ax7.text(0.5, 0.5, "No Convective Zone", ha='center', va='center', fontsize=12)
+ax7.set_xlabel('Relative Radius r/R')
+ax7.set_title('Convection Zone Distribution')
+ax7.set_xlim(0, 1)
+ax7.set_ylim(0.3, 0.7)
+ax7.set_yticks([])
+
+# 8. Temperature gradient comparison
+ax8 = plt.subplot(gs[2, 1])
+ax8.plot(r/R_star, dlogT_dlogP, 'b-', label='Actual Gradient')
+ax8.axhline(y=nabla_ad, color='r', linestyle='--', label='Adiabatic Gradient')
+ax8.axhline(y=nabla_ad + superadiabatic_threshold, color='g', linestyle=':', 
+           label='Convection Threshold')
+ax8.fill_between(r/R_star, nabla_ad, dlogT_dlogP, where=(dlogT_dlogP > nabla_ad),
+                color='red', alpha=0.3, label='Convective Region')
+ax8.set_xlabel('Relative Radius r/R')
+ax8.set_ylabel('$\\nabla = d\ln T/d\ln P$')
+ax8.set_title('Temperature Gradient Comparison')
+ax8.legend()
+ax8.grid(True, linestyle='--', alpha=0.7)
+ax8.set_ylim(0, 0.5)
+
+# 9. Physical parameters summary
+ax9 = plt.subplot(gs[2, 2])
+ax9.axis('off')
+
+# Convection diagnostics
+conv_percent = np.mean(convective) * 100
+core_conv = np.mean(convective[r/R_star < 0.3]) * 100
+surface_conv = np.mean(convective[r/R_star > 0.7]) * 100
+
+# Calculate effective temperature (corrected)
+T_eff = (L_total / (4 * np.pi * sigma * R_star**2)) ** 0.25
+
+param_text = (
+    f"Stellar Parameters Summary:\n\n"
+    f"Polytropic index n = {n:.2f}\n"
+    f"Central density ρ_c = {rho_c:.1f} g/cm³\n"
+    f"Central temperature T_c = {T_c/1e6:.2f} MK\n"
+    f"Metallicity Z = {Z:.3f}\n"
+    f"Stellar mass M = {M_total/M_sun:.3f} M⊙\n"
+    f"Stellar radius R = {R_star/R_sun:.3f} R⊙\n"
+    f"Stellar luminosity L = {L_total/L_sun:.3f} L⊙\n"
+    f"Effective temperature T_eff = {T_eff:.0f} K\n\n"
+    f"Convection Diagnostics:\n"
+    f"  - Convective fraction: {conv_percent:.1f}%\n"
+    f"  - Core convection fraction: {core_conv:.1f}%\n"
+    f"  - Surface convection fraction: {surface_conv:.1f}%"
+)
+ax9.text(0.05, 0.5, param_text, fontsize=11, family='monospace')
+
+plt.tight_layout()
+plt.savefig('stellar_structure_improved.png', bbox_inches='tight', dpi=300)
+plt.show()
+
+# ========================================================
+# Results Table and Diagnostics - Data output
+# ========================================================
+
+# Select key points for output
+indices = [0, len(r)//10, len(r)//4, len(r)//2, 3*len(r)//4, -2]
+
+print("\nStellar Internal Structure Parameters:")
+print("=" * 85)
+print(f"{'r/R':<8}{'ρ(g/cm³)':<12}{'T(MK)':<10}{'P(10^17)':<10}{'L_r/L':<8}{'Opacity':<10}{'Zone':<12}")
+print("-" * 85)
+
+for i in indices:
+    r_frac = r[i] / R_star
+    rho_val = rho[i]
+    T_val = T[i] / 1e6
+    P_val = P[i] / 1e17
+    L_frac = L_r[i] / L_total if L_total > 0 else 0
+    kappa_val = kappa[i]
+    
+    region = "Convective" if convective[i] else "Radiative"
+    
+    print(f"{r_frac:.4f}{rho_val:>12.3f}{T_val:>10.3f}{P_val:>10.2e}{L_frac:>8.3f}{kappa_val:>10.1f}{region:>12}")
+
+print("=" * 85)
+print(f"Note: Core region (r/R < {r[indices[1]]/R_star:.2f}) produces {L_r[indices[1]]/L_total:.1%} of total luminosity")
+
+# Additional diagnostics
+print("\nConvection Zone Analysis:")
+print("=" * 50)
+print(f"Maximum opacity: {np.max(kappa):.1f} cm²/g")
+print(f"Surface temperature: {T[-1]:.0f} K")
+print(f"Surface density: {rho[-1]:.2e} g/cm³")
+print(f"Maximum superadiabaticity: {np.max(dlogT_dlogP - nabla_ad):.4f}")
+print(f"Convective points: {np.sum(convective)}/{len(r)} ({conv_percent:.1f}%)")
+print(f"Surface convection fraction: {surface_conv:.1f}%")
+print(f"Effective temperature: {T_eff:.0f} K")
+
+# Plot convection diagnostics
+plt.figure(figsize=(12, 8))
+plt.subplot(211)
+plt.semilogy(r/R_star, kappa, 'r-')
+plt.ylabel('Opacity (cm²/g)')
+plt.title('Opacity Distribution')
+plt.grid(True)
+
+plt.subplot(212)
+plt.plot(r/R_star, dlogT_dlogP, 'b-', label='∇')
+plt.axhline(nabla_ad, color='r', linestyle='--', label='∇_ad')
+plt.axhline(nabla_ad + superadiabatic_threshold, color='g', linestyle=':', 
+           label='Convection Threshold')
+plt.fill_between(r/R_star, nabla_ad, dlogT_dlogP, 
+                 where=(dlogT_dlogP > nabla_ad), 
+                 color='red', alpha=0.3)
+plt.ylabel('dlnT/dlnP')
+plt.xlabel('Relative Radius r/R')
+plt.legend()
+plt.title('Convective Stability Analysis')
+plt.grid(True)
+plt.savefig('convection_analysis.png', dpi=300)
+plt.show()
+'''
